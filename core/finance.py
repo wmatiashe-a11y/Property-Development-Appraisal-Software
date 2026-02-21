@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import List, Optional
 
 
@@ -10,18 +9,16 @@ def _npv(rate: float, cashflows: List[float]) -> float:
 
 def irr_monthly(cashflows: List[float], guess: float = 0.01) -> Optional[float]:
     """
-    Simple IRR via Newton-Raphson. Returns monthly IRR, or None if not solvable.
-    cashflows: list where index is month; negative = outflow, positive = inflow
+    Newton-Raphson IRR (monthly). Returns None if not solvable.
     """
-    if not cashflows or all(abs(x) < 1e-9 for x in cashflows):
+    if not cashflows:
         return None
     if not (any(x < 0 for x in cashflows) and any(x > 0 for x in cashflows)):
         return None
 
     r = guess
-    for _ in range(100):
+    for _ in range(120):
         f = _npv(r, cashflows)
-        # derivative
         df = 0.0
         for i, cf in enumerate(cashflows):
             if i == 0:
@@ -31,12 +28,12 @@ def irr_monthly(cashflows: List[float], guess: float = 0.01) -> Optional[float]:
             break
         step = f / df
         r -= step
-        if abs(step) < 1e-8 and -0.999 < r < 10:
-            return r
         if r <= -0.999:
             r = -0.9
         if r > 10:
             r = 1.0
+        if abs(step) < 1e-8:
+            return r
     return None
 
 
