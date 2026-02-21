@@ -6,5 +6,6 @@ dev_appraisal/
     engine.py
     models.py
     finance.py
+    report.py
   data/
     db.py
