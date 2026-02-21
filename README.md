@@ -1,6 +1,6 @@
-# Development Appraisal — Streamlit MVP
+# Development Appraisal — Streamlit MVP+
 
-## Run locally
+## Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
