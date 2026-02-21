@@ -1,0 +1,10 @@
+dev_appraisal/
+  app.py
+  requirements.txt
+  README.md
+  core/
+    engine.py
+    models.py
+    finance.py
+  data/
+    db.py
