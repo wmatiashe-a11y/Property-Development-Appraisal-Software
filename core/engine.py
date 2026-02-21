@@ -3,11 +3,11 @@ from __future__ import annotations
 from typing import Dict, Any, List, Tuple
 import numpy as np
 
-from .models import Assumptions, Output
+from .models import Assumptions, Output, ProductLine
 from .finance import irr_monthly, annualize_monthly_rate, monthly_rate_from_pa
 
 
-def _sales_weights(n: int, curve: str) -> np.ndarray:
+def _weights(n: int, curve: str) -> np.ndarray:
     if n <= 0:
         return np.array([])
     x = np.linspace(0, 1, n)
@@ -15,67 +15,103 @@ def _sales_weights(n: int, curve: str) -> np.ndarray:
         w = 1 - x**1.8
     elif curve == "back":
         w = x**1.8 + 0.01
-    else:  # linear
+    else:
         w = np.ones(n)
     w = np.maximum(w, 1e-9)
     return w / w.sum()
 
 
 def _build_weights(n: int) -> np.ndarray:
-    """Simple S-curve-ish weights (MVP)."""
+    """Simple S-curve-ish weights for construction spend."""
     if n <= 0:
         return np.array([])
     x = np.linspace(-2, 2, n)
-    w = 1 / (1 + np.exp(-x))  # sigmoid
-    w = np.diff(np.concatenate([[0], w]))
+    s = 1 / (1 + np.exp(-x))
+    w = np.diff(np.concatenate([[0], s]))
     w = np.maximum(w, 1e-9)
     return w / w.sum()
 
 
-def run_appraisal(a: Assumptions, max_iter: int = 20) -> Output:
+def _allocate_product_revenue(products: List[ProductLine], months: int) -> Tuple[np.ndarray, float, float]:
+    """Return (monthly_revenue, total_gdv, total_sellable_sqm)."""
+    rev = np.zeros(months, dtype=float)
+    gdv = 0.0
+    sellable = 0.0
+
+    for p in products:
+        pv = float(p.gross_value())
+        gdv += pv
+        sellable += float(p.sellable_sqm())
+
+        start = int(max(0, p.start_month))
+        dur = int(max(1, p.duration_months))
+        end = min(months, start + dur)
+        dur_eff = max(0, end - start)
+        if dur_eff == 0:
+            continue
+
+        w = _weights(dur_eff, p.curve)
+        rev[start:end] += pv * w
+
+    return rev, gdv, sellable
+
+
+def _allocate_costs(a: Assumptions, months: int, sellable_sqm: float, gdv: float) -> Tuple[np.ndarray, float, List[Dict[str, Any]]]:
     """
-    Deterministic appraisal:
-    - Computes GDV with optional inclusionary split
-    - Computes costs ex land
-    - If land_price_input is None: solves residual land to hit target profit
-    - Builds monthly cashflow, applies debt interest on running balance
-    - Iterates land/finance linkage lightly for stability
+    Build the monthly cost stream (ex land, ex finance) and return:
+      - monthly_costs
+      - tdc_ex_land_ex_fin (total)
+      - audit_items (cost breakdown lines)
     """
     audit: List[Dict[str, Any]] = []
+    costs = np.zeros(months, dtype=float)
 
-    months = int(max(1, a.build_months + a.sales_months))
-    build_w = _build_weights(a.build_months)
-    sales_w = _sales_weights(a.sales_months, a.sales_curve)
-
-    # --- Revenue (GDV) ---
-    affordable_sqm = a.sellable_sqm * float(np.clip(a.inclusionary_rate, 0.0, 1.0))
-    market_sqm = a.sellable_sqm - affordable_sqm
-    gdv = market_sqm * a.sale_price_per_sqm + affordable_sqm * a.inclusionary_price_per_sqm
-
-    audit.append({"section": "Revenue", "key": "Sellable sqm", "value": a.sellable_sqm, "unit": "sqm"})
-    audit.append({"section": "Revenue", "key": "Market sqm", "value": market_sqm, "unit": "sqm"})
-    audit.append({"section": "Revenue", "key": "Affordable sqm", "value": affordable_sqm, "unit": "sqm"})
-    audit.append({"section": "Revenue", "key": "GDV", "value": gdv, "unit": a.currency})
-
-    # --- Build cost base ---
-    build_base = a.sellable_sqm * a.build_cost_per_sqm
-    heritage_uplift = build_base * a.heritage_cost_uplift_rate
+    # Build base + uplifts
+    build_base = sellable_sqm * float(a.build_cost_per_sqm)
+    heritage_uplift = build_base * float(a.heritage_cost_uplift_rate)
     build_base2 = build_base + heritage_uplift
 
-    # Escalation approx across build duration (MVP: average half-period escalation)
-    build_years = max(a.build_months, 1) / 12.0
-    escalation = build_base2 * a.escalation_rate_pa * (build_years / 2.0)
-    contingency = (build_base2 + escalation) * a.contingency_rate
+    # Escalation (approx half-period on build)
+    build_years = max(int(a.build_months), 1) / 12.0
+    escalation = build_base2 * float(a.escalation_rate_pa) * (build_years / 2.0)
+
+    contingency = (build_base2 + escalation) * float(a.contingency_rate)
     build_total = build_base2 + escalation + contingency
 
-    prof_fees = build_total * a.professional_fees_rate
-    marketing = gdv * a.marketing_rate
-    overhead = a.overhead_per_month * months
-
-    # Incentive grant reduces costs (MVP: treat as cost reduction)
+    prof_fees = build_total * float(a.professional_fees_rate)
+    marketing = gdv * float(a.marketing_rate)
+    overhead = float(a.overhead_per_month) * months
+    statutory = float(a.statutory_costs)
     incentive = float(a.incentive_grant)
 
-    tdc_ex_land_pre_finance = build_total + prof_fees + a.statutory_costs + marketing + overhead - incentive
+    # Timing: build costs over build window
+    bstart = int(max(0, a.build_start_month))
+    bmonths = int(max(1, a.build_months))
+    bend = min(months, bstart + bmonths)
+    b_eff = max(0, bend - bstart)
+
+    if b_eff > 0:
+        bw = _build_weights(b_eff)
+        costs[bstart:bend] += build_total * bw
+        costs[bstart:bend] += (prof_fees / b_eff)
+        costs[bstart:bend] += (statutory / b_eff)
+    else:
+        costs[0] += build_total + prof_fees + statutory
+
+    # Marketing: spread over months where revenue occurs (fallback: last 12 months)
+    if months > 0:
+        # Find months with revenue later in UI; for engine we approximate with last 12 months
+        m_start = max(0, months - 12)
+        mw = _weights(months - m_start, "linear")
+        costs[m_start:months] += marketing * mw
+
+    # Overhead: evenly across horizon
+    costs += overhead / months
+
+    # Incentive as negative cost at month 0
+    costs[0] -= incentive
+
+    tdc = float(costs.sum())
 
     audit.extend([
         {"section": "Costs", "key": "Build base", "value": build_base, "unit": a.currency},
@@ -84,154 +120,212 @@ def run_appraisal(a: Assumptions, max_iter: int = 20) -> Output:
         {"section": "Costs", "key": "Contingency", "value": contingency, "unit": a.currency},
         {"section": "Costs", "key": "Build total", "value": build_total, "unit": a.currency},
         {"section": "Costs", "key": "Professional fees", "value": prof_fees, "unit": a.currency},
-        {"section": "Costs", "key": "Statutory", "value": a.statutory_costs, "unit": a.currency},
+        {"section": "Costs", "key": "Statutory", "value": statutory, "unit": a.currency},
         {"section": "Costs", "key": "Marketing", "value": marketing, "unit": a.currency},
         {"section": "Costs", "key": "Overhead", "value": overhead, "unit": a.currency},
-        {"section": "Costs", "key": "Incentive grant (reduces cost)", "value": incentive, "unit": a.currency},
+        {"section": "Costs", "key": "Incentive (reduces cost)", "value": incentive, "unit": a.currency},
+        {"section": "Costs", "key": "TDC (ex land, ex finance)", "value": tdc, "unit": a.currency},
     ])
 
-    # Target profit (pre-land logic)
-    def target_profit(total_cost_incl_land: float) -> float:
-        if a.target_profit_basis == "cost":
-            return total_cost_incl_land * a.target_profit_rate
-        return gdv * a.target_profit_rate
+    return costs, tdc, audit
 
-    # Prepare monthly base cashflows (ex land and ex finance)
-    monthly_costs = np.zeros(months)
-    # Spread build-related components over build months
-    if a.build_months > 0:
-        build_stream = build_total * build_w
-        monthly_costs[:a.build_months] += build_stream
-        # professional fees / statutory roughly during build
-        monthly_costs[:a.build_months] += (prof_fees / a.build_months)
-        monthly_costs[:a.build_months] += (a.statutory_costs / a.build_months)
-    # marketing: during sales
-    if a.sales_months > 0:
-        monthly_costs[a.build_months:] += (marketing * sales_w)
-    # overhead: evenly across all months
-    monthly_costs += overhead / months
-    # incentive: apply month 0 as negative cost
-    monthly_costs[0] -= incentive
 
-    monthly_revenue = np.zeros(months)
-    if a.sales_months > 0:
-        monthly_revenue[a.build_months:] = gdv * sales_w
+def _simulate_monthly_finance(
+    a: Assumptions,
+    months: int,
+    monthly_revenue: np.ndarray,
+    monthly_costs_ex_land_ex_fin: np.ndarray,
+    land_value: float,
+    peak_guess: float,
+) -> Tuple[List[Dict[str, Any]], float, float, float]:
+    """
+    Explicit monthly cashflow with debt:
+      - Start with equity injection at month 0 (cash)
+      - Each month: cash += revenue - costs - fees - interest
+      - If cash < 0 => draw debt to bring cash to 0
+      - If cash > 0 and debt > 0 => repay debt (using cash)
+      - Interest charged monthly on opening debt balance; treated as a cash outflow
+      - Fees:
+          arrangement fee = peak_debt * rate (paid at a.fees_paid_month)
+          exit fee        = peak_debt * rate (paid in final month)
+    We iterate fees externally by passing a peak_guess; return the actual peak.
+    """
+    r_m = monthly_rate_from_pa(float(a.debt_interest_rate_pa))
 
-    r_m = monthly_rate_from_pa(a.debt_interest_rate_pa)
-
-    land = a.land_price_input if a.land_price_input is not None else 0.0
+    cash = 0.0
+    debt = 0.0
+    peak = 0.0
     finance_costs = 0.0
-    peak_debt = 0.0
 
-    # Iterate to stabilize land <-> finance (land paid month 0 for MVP)
-    for _ in range(max_iter):
-        cashflow = monthly_revenue - monthly_costs
+    rows: List[Dict[str, Any]] = []
 
-        # land treated as month 0 outflow
-        cashflow0 = cashflow.copy()
-        cashflow0[0] -= land
+    # Fee schedule based on peak_guess (outer iteration refines)
+    arr_fee = float(peak_guess) * float(a.debt_arrangement_fee_rate) if a.use_debt else 0.0
+    exit_fee = float(peak_guess) * float(a.debt_exit_fee_rate) if a.use_debt else 0.0
+
+    for m in range(months):
+        rev = float(monthly_revenue[m])
+        cost = float(monthly_costs_ex_land_ex_fin[m])
+
+        land = 0.0
+        if a.land_paid_month == m:
+            land = float(land_value)
+
+        equity_in = 0.0
+        if m == 0:
+            equity_in = float(a.equity_injection_month0)
+
+        fee = 0.0
+        if a.use_debt and m == int(a.fees_paid_month):
+            fee += arr_fee
+        if a.use_debt and m == months - 1:
+            fee += exit_fee
+
+        # Interest on opening balance
+        interest = float(debt) * float(r_m) if a.use_debt else 0.0
+
+        # Cash movement before debt draw/repay
+        cash += equity_in + rev - cost - land - fee - interest
+
+        debt_draw = 0.0
+        debt_repay = 0.0
 
         if a.use_debt:
-            # Debt finances negative running balance; interest charged on drawn balance
-            debt_balance = 0.0
-            interest_paid = 0.0
-            debt_track = np.zeros(months)
-            interest_track = np.zeros(months)
+            if cash < 0:
+                debt_draw = -cash
+                debt += debt_draw
+                cash = 0.0
+            elif cash > 0 and debt > 0:
+                debt_repay = min(cash, debt)
+                debt -= debt_repay
+                cash -= debt_repay
 
-            for m in range(months):
-                # Apply cashflow first
-                debt_balance -= cashflow0[m]  # if cashflow is -ve, debt increases
-                if debt_balance < 0:
-                    # surplus pays down debt, but debt can't go negative
-                    debt_balance = 0.0
-                # Interest on end-of-month balance
-                i = debt_balance * r_m
-                interest_paid += i
-                debt_balance += i
-                debt_track[m] = debt_balance
-                interest_track[m] = i
+        peak = max(peak, debt)
+        finance_costs += interest + fee
 
-            peak = float(debt_track.max(initial=0.0))
-            arr_fee = peak * a.debt_arrangement_fee_rate
-            exit_fee = peak * a.debt_exit_fee_rate
-            finance_new = float(interest_paid + arr_fee + exit_fee)
+        rows.append({
+            "Month": m,
+            "Equity in": equity_in,
+            "Revenue": rev,
+            "Costs (ex land, ex fin)": cost,
+            "Land": land,
+            "Interest": interest,
+            "Fees": fee,
+            "Net pre debt": equity_in + rev - cost - land - interest - fee,
+            "Debt draw": debt_draw,
+            "Debt repay": debt_repay,
+            "Debt balance": debt,
+            "Cash balance": cash,
+        })
 
-            # Add finance into month-end of build (MVP: allocate to last month)
-            # More realistic later: spread fees/interest, but OK for MVP.
-            cashflow_fin = cashflow0.copy()
-            cashflow_fin[-1] -= (arr_fee + exit_fee)
-            cashflow_fin += 0.0  # interest already embedded in debt path, not in cashflow here
+    return rows, float(finance_costs), float(peak), float(arr_fee + exit_fee)
 
-            finance_costs = finance_new
-            peak_debt = peak
-        else:
-            finance_costs = 0.0
-            peak_debt = 0.0
 
-        # Solve land if residual mode
-        if a.land_price_input is None:
-            # total cost incl land and finance
-            # finance_costs are "extra" costs, add to total
-            # profit = GDV - (tdc_ex_land_pre_finance + finance_costs + land)
-            # Need profit to match target basis.
-            # If basis is cost: target uses total_cost_incl_land, which includes land and finance.
-            # Solve with simple rearrangement; if cost basis, do fixed-point iteration.
-            if a.target_profit_basis == "gdv":
-                # profit = gdv*(1 - target_rate)
-                desired_profit = gdv * a.target_profit_rate
-                land_new = gdv - (tdc_ex_land_pre_finance + finance_costs) - desired_profit
-            else:
-                # profit = (cost_incl_land)*target_rate
-                # profit = gdv - (cost_ex_land + finance + land)
-                # gdv - (c + land) = (c + land)*p
-                # gdv = (c + land)*(1 + p)
-                # land = gdv/(1+p) - c
-                c = (tdc_ex_land_pre_finance + finance_costs)
-                land_new = (gdv / (1.0 + a.target_profit_rate)) - c
+def run_appraisal(a: Assumptions, max_iter: int = 30) -> Output:
+    """
+    Full appraisal:
+      - Product mix revenue schedule and GDV
+      - Cost schedule ex land/ex finance
+      - Monthly debt cashflow (interest + fees)
+      - Residual land solve if land not input, to hit target developer return (gdv or cost)
+    """
+    months = int(max(1, a.months_total))
 
-            # prevent absurd negatives if user inputs are extreme
-            land_new = float(land_new)
-            if abs(land_new - land) < 1.0:
-                land = land_new
+    audit: List[Dict[str, Any]] = []
+    monthly_revenue, gdv, sellable_sqm = _allocate_product_revenue(a.products, months)
+
+    audit.append({"section": "Revenue", "key": "GDV", "value": gdv, "unit": a.currency})
+    audit.append({"section": "Areas", "key": "Sellable sqm (sum of products)", "value": sellable_sqm, "unit": "sqm"})
+
+    monthly_costs, tdc_ex_land_ex_fin, cost_audit = _allocate_costs(a, months, sellable_sqm, gdv)
+    audit.extend(cost_audit)
+
+    def target_profit(total_cost_incl_land: float) -> float:
+        if a.target_profit_basis == "cost":
+            return total_cost_incl_land * float(a.target_profit_rate)
+        return gdv * float(a.target_profit_rate)
+
+    # Residual solve loop (land affects finance via month cash needs)
+    land = float(a.land_price_input) if a.land_price_input is not None else 0.0
+    finance_costs = 0.0
+    peak_debt = 0.0
+    cashflow_rows: List[Dict[str, Any]] = []
+
+    # Outer fixed-point iterations
+    for _ in range(max_iter):
+        # Fee/peak refinement: small inner loop
+        peak_guess = max(peak_debt, 0.0)
+        for __ in range(4):
+            rows, fin_cost, peak, _fees = _simulate_monthly_finance(
+                a=a,
+                months=months,
+                monthly_revenue=monthly_revenue,
+                monthly_costs_ex_land_ex_fin=monthly_costs,
+                land_value=land,
+                peak_guess=max(peak_guess, peak_debt, 1.0),
+            )
+            # Use actual peak as next guess
+            if abs(peak - peak_guess) < 1.0:
+                peak_guess = peak
+                finance_costs = fin_cost
+                peak_debt = peak
+                cashflow_rows = rows
                 break
-            land = land_new
-        else:
+            peak_guess = peak
+            finance_costs = fin_cost
+            peak_debt = peak
+            cashflow_rows = rows
+
+        if a.land_price_input is not None:
             break
 
-    # Final totals
-    tdc_ex_land = tdc_ex_land_pre_finance
-    total_cost_incl_land = tdc_ex_land + finance_costs + land
-    profit = gdv - total_cost_incl_land
-    profit_rate_on_gdv = (profit / gdv) if gdv else 0.0
-    profit_rate_on_cost = (profit / total_cost_incl_land) if total_cost_incl_land else 0.0
+        # Solve land to hit target return
+        # Profit = GDV - (TDC_ex + finance + land)
+        # If basis = GDV: target profit is GDV * rate => land = GDV - TDC_ex - finance - target_profit
+        # If basis = Cost: target profit = (TDC_ex + finance + land) * rate
+        #   => GDV - (C + land) = (C + land)*p
+        #   => GDV = (C + land)*(1+p) => land = GDV/(1+p) - C
+        C = float(tdc_ex_land_ex_fin + finance_costs)
+        if a.target_profit_basis == "gdv":
+            desired_profit = gdv * float(a.target_profit_rate)
+            land_new = gdv - C - desired_profit
+        else:
+            land_new = (gdv / (1.0 + float(a.target_profit_rate))) - C
 
-    # Equity cashflows (very MVP): assume equity funds any shortfall not covered by debt
-    # For now: approximate equity as (total_cost - peak_debt) at month0 outflow + revenues later.
+        if abs(land_new - land) < 5.0:
+            land = float(land_new)
+            break
+        land = float(land_new)
+
+    total_cost_incl_land = float(tdc_ex_land_ex_fin + finance_costs + land)
+    profit = float(gdv - total_cost_incl_land)
+    profit_rate_on_gdv = float(profit / gdv) if gdv else 0.0
+    profit_rate_on_cost = float(profit / total_cost_incl_land) if total_cost_incl_land else 0.0
+
+    # Equity IRR approximation using net equity cashflows (derived from model cashflow rows)
     irr_pa = None
     try:
-        # crude equity series: month0 equity out, last month equity back = profit + equity
-        equity0 = max(0.0, total_cost_incl_land - peak_debt) + float(a.equity_injection_month0)
-        eq_cf = [-equity0] + [0.0] * (months - 2) + [equity0 + profit]
+        # equity CF: use "Net pre debt" minus debt draw/repay mechanics implies equity is what's not funded by debt
+        # For a simple, stable IRR: take actual net cash to equity each month as:
+        #   equity_cf = revenue - costs - land - interest - fees - (change in debt)
+        eq_cf = []
+        prev_debt = 0.0
+        for r in cashflow_rows:
+            debt_bal = float(r["Debt balance"])
+            d_debt = debt_bal - prev_debt
+            prev_debt = debt_bal
+            eq_cf.append(float(r["Revenue"]) - float(r["Costs (ex land, ex fin)"]) - float(r["Land"]) - float(r["Interest"]) - float(r["Fees"]) - d_debt + float(r["Equity in"]))
         irr_pa = annualize_monthly_rate(irr_monthly(eq_cf))
     except Exception:
         irr_pa = None
 
-    # Build a cashflow table for UI (show revenue/cost net, plus headline)
-    table: List[Dict[str, Any]] = []
-    for m in range(months):
-        table.append({
-            "Month": m + 1,
-            "Revenue": float(monthly_revenue[m]),
-            "Cost (ex land)": float(monthly_costs[m]),
-            "Net (ex land)": float(monthly_revenue[m] - monthly_costs[m]),
-        })
-
     audit.extend([
         {"section": "Profit", "key": "Target basis", "value": a.target_profit_basis, "unit": ""},
-        {"section": "Profit", "key": "Target profit rate", "value": a.target_profit_rate, "unit": "ratio"},
-        {"section": "Land", "key": "Land value (residual or input)", "value": land, "unit": a.currency},
-        {"section": "Finance", "key": "Finance costs", "value": finance_costs, "unit": a.currency},
+        {"section": "Profit", "key": "Target profit rate", "value": float(a.target_profit_rate), "unit": "ratio"},
+        {"section": "Finance", "key": "Finance costs (interest+fees)", "value": finance_costs, "unit": a.currency},
         {"section": "Finance", "key": "Peak debt", "value": peak_debt, "unit": a.currency},
+        {"section": "Land", "key": "Land value (residual or input)", "value": land, "unit": a.currency},
+        {"section": "Profit", "key": "Total cost (incl land)", "value": total_cost_incl_land, "unit": a.currency},
         {"section": "Profit", "key": "Profit", "value": profit, "unit": a.currency},
         {"section": "Profit", "key": "Profit % GDV", "value": profit_rate_on_gdv, "unit": "ratio"},
         {"section": "Profit", "key": "Profit % Cost", "value": profit_rate_on_cost, "unit": "ratio"},
@@ -240,34 +334,53 @@ def run_appraisal(a: Assumptions, max_iter: int = 20) -> Output:
     return Output(
         currency=a.currency,
         gdv=float(gdv),
-        tdc_ex_land=float(tdc_ex_land),
-        land_value=float(land),
+        sellable_sqm=float(sellable_sqm),
+        tdc_ex_land_ex_fin=float(tdc_ex_land_ex_fin),
         finance_costs=float(finance_costs),
+        land_value=float(land),
+        total_cost_incl_land=float(total_cost_incl_land),
         profit=float(profit),
         profit_rate_on_gdv=float(profit_rate_on_gdv),
         profit_rate_on_cost=float(profit_rate_on_cost),
-        irr_equity_pa=None if irr_pa is None else float(irr_pa),
         peak_debt=float(peak_debt),
-        months=int(months),
-        cashflow_table=table,
+        irr_equity_pa=None if irr_pa is None else float(irr_pa),
+        cashflow_rows=cashflow_rows,
         audit=audit,
     )
 
 
-def sensitivity_grid(a: Assumptions, price_steps=(-0.1, -0.05, 0, 0.05, 0.1), cost_steps=(-0.1, -0.05, 0, 0.05, 0.1)) -> Tuple[List[str], List[str], np.ndarray]:
+def sensitivity_grid(
+    a: Assumptions,
+    price_steps=(-0.1, -0.05, 0, 0.05, 0.1),
+    cost_steps=(-0.1, -0.05, 0, 0.05, 0.1),
+) -> Tuple[List[str], List[str], np.ndarray]:
     """
-    Returns (row_labels, col_labels, matrix) for a 2D heatmap:
-    rows = price changes, cols = cost changes, values = residual land.
+    2D sensitivity: (blended) sales prices vs build cost -> residual land.
+    Applies price factor to ALL product price_per_sqm (and price_per_unit if set).
     """
     rows = [f"{int(p*100)}%" for p in price_steps]
     cols = [f"{int(c*100)}%" for c in cost_steps]
-    mat = np.zeros((len(rows), len(cols)))
+    mat = np.zeros((len(rows), len(cols)), dtype=float)
+
+    base = a.to_dict()
 
     for i, dp in enumerate(price_steps):
         for j, dc in enumerate(cost_steps):
-            aa = Assumptions.from_dict(a.to_dict())
-            aa.sale_price_per_sqm = a.sale_price_per_sqm * (1 + dp)
-            aa.build_cost_per_sqm = a.build_cost_per_sqm * (1 + dc)
+            dd = dict(base)
+            dd["build_cost_per_sqm"] = float(base["build_cost_per_sqm"]) * (1 + dc)
+
+            # adjust product prices
+            plist = []
+            for p in base["products"]:
+                pp = dict(p)
+                pp["price_per_sqm"] = float(pp["price_per_sqm"]) * (1 + dp)
+                if pp.get("price_per_unit") is not None:
+                    pp["price_per_unit"] = float(pp["price_per_unit"]) * (1 + dp)
+                plist.append(pp)
+            dd["products"] = plist
+
+            aa = Assumptions.from_dict(dd)
             out = run_appraisal(aa)
             mat[i, j] = out.land_value
+
     return rows, cols, mat
