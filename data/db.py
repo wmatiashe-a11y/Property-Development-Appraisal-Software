@@ -73,11 +73,18 @@ def save_appraisal(project_id: int, version_name: str, assumptions: Dict[str, An
         return int(cur.lastrowid)
 
 
-def load_appraisal(appraisal_id: int) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+def load_appraisal(appraisal_id: int) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]:
     with connect() as conn:
         row = conn.execute("SELECT * FROM appraisals WHERE id=?", (appraisal_id,)).fetchone()
         if not row:
             return None
         assumptions = json.loads(row["assumptions_json"])
         outputs = json.loads(row["outputs_json"]) if row["outputs_json"] else {}
-        return assumptions, outputs
+        meta = {"version_name": row["version_name"], "created_at": row["created_at"], "project_id": row["project_id"], "id": row["id"]}
+        return assumptions, outputs, meta
+
+
+def get_project(project_id: int) -> Optional[Dict[str, Any]]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        return dict(row) if row else None
